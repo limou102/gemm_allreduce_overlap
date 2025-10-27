@@ -115,7 +115,7 @@ def parse_args():
     parser.add_argument("-k", type=int, default=36864, help="Common dimension between matrices A and B (GEMM)")
     parser.add_argument(
         "--comm-size", type=int, default=None, help="Number of float32 elements for communication tensor", required=True)
-    parser.add_argument("--num-comm-cu", type=int, default=None, help="number of CU for communication stream, default None means use all compute units")
+    parser.add_argument("--num-comm-cu", type=int, default=None, help="number of CU for communication stream, default None or -1 means use all compute units")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable PyTorch profiler to generate chrome trace")
     return parser.parse_args()
 
