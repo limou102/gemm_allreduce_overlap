@@ -1,6 +1,9 @@
+#include "gemm_runner.hpp"
+
+#include <thread>
+#include <chrono>
 #include <iostream>
 #include <cstdlib>
-//#include <set>
 #include <vector>
 #include <algorithm>
 #include <inttypes.h>
@@ -23,24 +26,19 @@
 constexpr int _MaxDevices = 8;
 constexpr int _MaxLinks = _MaxDevices - 1;
 
-size_t _target_transfer_size = 256ull * 1024 * 1024;
+size_t _target_transfer_size = 64ull * 1024 * 1024; //64MB
 bool _local_read = true;
-int _block_size = -1;
-int _prewarm_iters = 100;
-int _test_iters = 100;
-bool _report_metric = true;
-int _cu_min = 1;
-int _cu_max = 1;
-int _cu_step = 1;
-int _dw_count = 4;
+int _comm_iters = 20;
 
 int _device_count = 0;
 int _links_per_device = 0;
 void** _src = {};
 void** _dst = {};
 
-std::vector<int> _wg_size_list;
-std::vector<int> _unroll_list;
+std::vector<hipStream_t> _comm_streams;
+std::vector<hipStream_t> _gemm_streams;
+std::vector<GemmRunner> _gemm_runners;
+int _gemm_iters = 20;
 
 typedef void (*kernel_t)(void** __restrict, void** __restrict, int, int, int, int, int, int);
 
@@ -168,15 +166,6 @@ void RunTest(int unroll, int wg_size, int cu, int block_size)
     int iters = static_cast<int>(_target_transfer_size / total_iter_size);
     size_t actual_transfer_size = total_iter_size * iters;
 
-    hipEvent_t start[_MaxDevices];
-    hipEvent_t stop[_MaxDevices];
-    for (int dev = 0; dev < _device_count; dev++)
-    {
-        _CHECK(hipSetDevice(dev));
-        _CHECK(hipEventCreate(&start[dev]));
-        _CHECK(hipEventCreate(&stop[dev]));
-    }
-
     kernel_t kernel;
     switch (unroll)
     {
@@ -195,209 +184,44 @@ void RunTest(int unroll, int wg_size, int cu, int block_size)
 
     const dim3 grid_dim(cu, 1, 1);
     const dim3 block_dim(wg_size, 1, 1);
-    for (int i = 0; i < _prewarm_iters; i++)
+    for (int i = 0; i < _comm_iters; i++)
     {
         for (int dev = 0; dev < _device_count; dev++)
         {
             _CHECK(hipSetDevice(dev));
-            kernel<<<grid_dim, block_dim, 0, 0>>>(_src, _dst, dev, _links_per_device, block_size, link_stride_items, iters, active_threads);
+            kernel<<<grid_dim, block_dim, 0, _comm_streams[dev]>>>(_src, _dst, dev, _links_per_device, block_size, link_stride_items, iters, active_threads);
         }
-    }
-    for (int dev = 0; dev < _device_count; dev++)
-    {
-        _CHECK(hipSetDevice(dev));
-        _CHECK(hipDeviceSynchronize());
-    }
-
-    std::vector<double> min_bw(_MaxDevices, __FLT_MAX__);
-    std::vector<double> max_bw(_MaxDevices, 0.0f);
-    std::vector<double> sum_bw(_MaxDevices, 0.0f);
-
-    for (int i = 0; i < _test_iters; i++)
-    {
-        for (int dev = 0; dev < _device_count; dev++)
-        {
-            _CHECK(hipSetDevice(dev));
-            hipExtLaunchKernelGGL(kernel, grid_dim, block_dim, 0, 0, start[dev], stop[dev], 0,
-                _src, _dst, dev, _links_per_device, block_size, link_stride_items, iters, active_threads);
-        }
-
-        for (int dev = 0; dev < _device_count; dev++)
-        {
-            _CHECK(hipSetDevice(dev));
-            _CHECK(hipEventSynchronize(stop[dev]));
-            float t_ms;
-            _CHECK(hipEventElapsedTime(&t_ms, start[dev], stop[dev]));
-            double bw = (double)actual_transfer_size * _links_per_device / (t_ms  / 1000.0) / 1000000000;
-            if (!_report_metric)
-            {
-                bw /= 1.024 * 1.024 * 1.024;
-            }
-
-            min_bw[dev] = std::min(min_bw[dev], bw);
-            max_bw[dev] = std::max(max_bw[dev], bw);
-            sum_bw[dev] += bw;
-        }
-    }
-
-    for (int dev = 0; dev < _device_count; dev++)
-    {
-        double avg_bw = sum_bw[dev] / _test_iters;
-        printf("%s,%d,%d,%d,%d,%.2f,%d,%.1f,%.1f,%.1f\n", _local_read ? "Y" : "N", wg_size, block_size, unroll, cu, used_cu, dev, min_bw[dev], max_bw[dev], avg_bw);
-    }
-
-    for (int dev = 0; dev < _device_count; dev++)
-    {
-        _CHECK(hipEventDestroy(start[dev]));
-        _CHECK(hipEventDestroy(stop[dev]));
     }
 }
 
 void SetDefaults()
 {
-    for (int wg_size = 256; wg_size <= 1024; wg_size += 64)
-    {
-        _wg_size_list.push_back(wg_size);
-    }
-    for (int unroll = 1; unroll <= 8; unroll++)
-    {
-        _unroll_list.push_back(unroll);
-    }
-}
-
-void LoadValList(std::vector<int>& d, const char* s)
-{
-    d.clear();
-
-    char b[100];
-    strncpy(b, s, 100);
-    char* t = strtok(b, ",");
-    while (t != NULL)
-    {
-        d.push_back(atoi(t));
-        t = strtok(NULL, ",");
+    _comm_streams.resize(_device_count);
+    _gemm_streams.resize(_device_count);
+    _gemm_runners.resize(_device_count);
+    for (int dev = 0; dev < _device_count; dev++) {
+        _CHECK(hipSetDevice(dev));
+        _CHECK(hipStreamCreateWithFlags(&_comm_streams[dev], hipStreamNonBlocking));
+        _CHECK(hipStreamCreateWithFlags(&_gemm_streams[dev], hipStreamNonBlocking));
+        _gemm_runners[dev].Init(static_cast<uint64_t>(1)<<31, 8, 4096, 2048, 4096);
+        _gemm_runners[dev].RunSelf(_gemm_streams[dev]);
     }
 }
 
-void ParseParams(char** argv)
-{
-    int i = 1;
-    while (argv[i] != NULL)
+void SyncAllDevices() {
+    for(int dev = 0; dev < _device_count; dev++)
     {
-        if (strcmp(argv[i], "-s") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing per-link transfer size in MiB\n");
-                exit(1);
-            }
-            _target_transfer_size = atoi(argv[i + 1]) * 1024 * 1024;
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-i") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing test iterations\n");
-                exit(1);
-            }
-            _test_iters = atoi(argv[i + 1]);
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-p") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing prewarm iterations\n");
-                exit(1);
-            }
-            _prewarm_iters = atoi(argv[i + 1]);
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-lr") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing local read flag value\n");
-                exit(1);
-            }
-            _local_read = atoi(argv[i + 1]) != 0;
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-m") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing reported metric unit flag value\n");
-                exit(1);
-            }
-            _report_metric = atoi(argv[i + 1]) != 0;
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-wg") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing workgroup size\n");
-                exit(1);
-            }
-            LoadValList(_wg_size_list, argv[i + 1]);
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-u") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing unroll count\n");
-                exit(1);
-            }
-            LoadValList(_unroll_list, argv[i + 1]);
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-cu") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing CU count cpecification using {min,max,step} format\n");
-                exit(1);
-            }
-            std::vector<int> cu_params;
-            LoadValList(cu_params, argv[i + 1]);
-            i += 2;
+        _CHECK(hipSetDevice(dev));
+        _CHECK(hipDeviceSynchronize());
+    }
+}
 
-            if (cu_params.size() != 3)
-            {
-                printf("Incorrect CU count specification. Expected {min,max,step} format\n");
-                exit(1);
-            }
-            _cu_min = cu_params[0];
-            _cu_max = cu_params[1];
-            _cu_step = cu_params[2];
-        }
-        else if (strcmp(argv[i], "-b") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing block size\n");
-                exit(1);
-            }
-            _block_size = atoi(argv[i + 1]);
-            i += 2;
-        }
-        else if (strcmp(argv[i], "-d") == 0)
-        {
-            if (argv[i + 1] == NULL)
-            {
-                printf("Missing data size in DWORDs\n");
-                exit(1);
-            }
-            _dw_count = atoi(argv[i + 1]);
-            i += 2;
-        }
-        else
-        {
-            printf("Unknown parameter %s\n", argv[i]);
-            exit(1);
+void LaunchGemm()
+{
+    for(int i=0; i<_gemm_iters; i++) {
+        for(int dev = 0; dev < _device_count; dev++) {
+            _CHECK(hipSetDevice(dev));
+            _gemm_runners[dev].RunSelf(_gemm_streams[dev]);
         }
     }
 }
@@ -416,37 +240,30 @@ int main(int argc, char **argv)
         _device_count = _MaxDevices;
     }
     _links_per_device = _device_count - 1;
-    _cu_min = _links_per_device;
-    _cu_max = _links_per_device * 16;
-    _cu_step = _links_per_device;
 
     SetDefaults();
-    if (argc > 1)
-    {
-        ParseParams(argv);
-    }
-
     SetupTransfers();
-    printf("local_read,wg_size,block_size,unroll,cu_target,cu_used,dev,min_bw,max_bw,avg_bw\n");
-    for (auto wg_size : _wg_size_list)
-    {
-        for (auto unroll : _unroll_list)
-        {
-            for (int cu = _cu_min; cu <= _cu_max; cu += _cu_step)
-            {
-                int block_size = (_block_size == -1) ? wg_size : _block_size;
-                switch (_dw_count)
-                {
-                    case 1: RunTest<uint32_t>(unroll, wg_size, cu, block_size); break;
-                    case 2: RunTest<uint64_t>(unroll, wg_size, cu, block_size); break;
-                    case 4: RunTest<__uint128_t>(unroll, wg_size, cu, block_size); break;
-                    default: printf("Wrong data size\n");
-                }
-            }
-        }
-    }
-    DestroyTransfers();
+    SyncAllDevices();
 
+    // TODO : use conditional event for barrier
+    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    
+    // run gemm alone
+    LaunchGemm();
+    SyncAllDevices();
+
+    // run communication alone
+    // unroll=4, wg=256, cu=21
+    // These parameters can achieve a bandwidth of 320 GB/s on the MI300X, which is close to saturation
+    RunTest<__uint128_t>(4, 256, 21, 256);
+    SyncAllDevices();
+
+    // run gemm + communication overlap
+    LaunchGemm();
+    RunTest<__uint128_t>(4, 256, 21, 256);
+    SyncAllDevices();
+
+    DestroyTransfers();
     return 0;
 }
 

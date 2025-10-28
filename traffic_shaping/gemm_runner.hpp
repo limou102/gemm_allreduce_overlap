@@ -5,8 +5,6 @@
 #include <stdexcept>
 #include <iostream>
 
-
-
 #define CHECK_ZERO(x) \
     do { \
         auto __error_code = (x); \
@@ -17,7 +15,6 @@
         } \
     } while(false)
 
-namespace {
 
 class GemmRunner final
 {
@@ -26,8 +23,15 @@ public:
     // B (nxk)
     // C (mxn)
     // C = 1.0f * A * B(T) + 0.0f * C
-    GemmRunner(uint64_t workspace_size, int32_t batch_size, uint64_t m, uint64_t n, uint64_t k)
+    GemmRunner() = default;
+
+    ~GemmRunner()
     {
+        // TODO : destroy resources
+        // ...
+    }
+
+    void Init(uint64_t workspace_size, int32_t batch_size, uint64_t m, uint64_t n, uint64_t k) {
         CHECK_ZERO(hipblasLtCreate(&handle_));
         CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_a_, HIP_R_32F, m, k, k));
         CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_b_, HIP_R_32F, n, k, n));
@@ -89,7 +93,7 @@ public:
         CHECK_ZERO(hipDeviceSynchronize());
     }
 
-    void RunSelf() {
+    void RunSelf(hipStream_t stream) {
         CHECK_ZERO(hipblasLtMatmul(
                     handle_,
                     matmul_desc_,
@@ -106,14 +110,9 @@ public:
                     &result_.algo,
                     d_ws_,
                     ws_size_,
-                    0));
+                    stream));
     }
 
-    ~GemmRunner()
-    {
-        // TODO : destroy resources
-        // ...
-    }
 private:
     hipblasLtHandle_t handle_;
     hipblasLtMatrixLayout_t mat_layout_a_;
@@ -132,13 +131,3 @@ private:
     const float beta_ {0.0f};
 };
 
-} // namespace
-
-int main(int argc, char *argv[])
-{
-    GemmRunner gemm_runner(static_cast<uint64_t>(1)<<31, 8, 4096, 2048, 4096);
-    gemm_runner.RunSelf();
-    gemm_runner.RunSelf();
-    gemm_runner.RunSelf();
-    return 0;
-}
