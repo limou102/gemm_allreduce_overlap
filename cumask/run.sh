@@ -21,7 +21,7 @@ common_command='torchrun --nproc_per_node=8 --rdzv_backend c10d --rdzv_endpoint=
 
 for shape in "${gemm_shapes[@]}"; do
     read -r m n k comm_size<<< "$shape"
-    launch_command_rccl="${common_command} benchmark_rccl_allreduce_hipblaslt_cumask.py -m $m -n $n -k $k --comm-size $comm_size --num-comm-cu -1 2>/dev/null"
+    launch_command_rccl="${common_command} benchmark_rccl_allreduce_hipblaslt_cumask.py -m $m -n $n -k $k --comm-size $comm_size --num-comm-cu 24 2>/dev/null"
     echo "launch with command : $launch_command_rccl"
     eval $launch_command_rccl
 
