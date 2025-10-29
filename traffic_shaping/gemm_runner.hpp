@@ -19,10 +19,12 @@
 class GemmRunner final
 {
 public:
-    // A (mxk)
-    // B (nxk)
-    // C (mxn)
-    // C = 1.0f * A * B(T) + 0.0f * C
+    // A (mxk) rowmajor
+    // B (kxn) rowmajor
+    // C (mxn) rowmajor
+    // C = 1.0f * A * B + 0.0f * C
+    //
+    // need to convert to colmajor implicitly since hipblaslt use colmajor
     GemmRunner() = default;
 
     ~GemmRunner()
@@ -33,13 +35,15 @@ public:
 
     void Init(uint64_t workspace_size, int32_t batch_size, uint64_t m, uint64_t n, uint64_t k) {
         CHECK_ZERO(hipblasLtCreate(&handle_));
-        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_a_, HIP_R_32F, m, k, k));
-        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_b_, HIP_R_32F, n, k, n));
-        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_c_, HIP_R_32F, m, n, n));
+        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_a_, HIP_R_32F, n, k, n));
+        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_b_, HIP_R_32F, k, m, k));
+        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_c_, HIP_R_32F, n, m, n));
+        CHECK_ZERO(hipblasLtMatrixLayoutCreate(&mat_layout_d_, HIP_R_32F, n, m, n));
         if (batch_size > 1) {
-            int64_t stride_a = m * k;
-            int64_t stride_b = n * k;
-            int64_t stride_c = m * n;
+            int64_t stride_a = n * k;
+            int64_t stride_b = k * m;
+            int64_t stride_c = n * m;
+            int64_t stride_d = n * m;
             CHECK_ZERO(hipblasLtMatrixLayoutSetAttribute(
                 mat_layout_a_, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
             CHECK_ZERO(hipblasLtMatrixLayoutSetAttribute(
@@ -52,11 +56,17 @@ public:
                 mat_layout_c_, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
             CHECK_ZERO(hipblasLtMatrixLayoutSetAttribute(
                 mat_layout_c_, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+            CHECK_ZERO(hipblasLtMatrixLayoutSetAttribute(
+                mat_layout_d_, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
+            CHECK_ZERO(hipblasLtMatrixLayoutSetAttribute(
+                mat_layout_d_, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_d, sizeof(stride_d)));
         }
 
         CHECK_ZERO(hipblasLtMatmulDescCreate(&matmul_desc_, HIPBLAS_COMPUTE_32F, HIP_R_32F));
 
-        hipblasOperation_t trans_b = HIPBLAS_OP_T;
+        hipblasOperation_t trans_a = HIPBLAS_OP_N;
+        hipblasOperation_t trans_b = HIPBLAS_OP_N;
+        CHECK_ZERO(hipblasLtMatmulDescSetAttribute(matmul_desc_, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
         CHECK_ZERO(hipblasLtMatmulDescSetAttribute(matmul_desc_, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
 
         int returnedAlgoCount = 0;
@@ -68,7 +78,7 @@ public:
                     mat_layout_a_,
                     mat_layout_b_,
                     mat_layout_c_,
-                    mat_layout_c_,
+                    mat_layout_d_,
                     pref,
                     1,
                     &result_,
@@ -81,15 +91,14 @@ public:
 
         CHECK_ZERO(hipblasLtMatmulPreferenceDestroy(pref));
 
-        CHECK_ZERO(hipMalloc(&d_a_, m*k*batch_size*sizeof(float)));
-        CHECK_ZERO(hipMemset(d_a_, 0, m*k*batch_size*sizeof(float)));
-        CHECK_ZERO(hipMalloc(&d_b_, n*k*batch_size*sizeof(float)));
-        CHECK_ZERO(hipMemset(d_b_, 0, n*k*batch_size*sizeof(float)));
-        CHECK_ZERO(hipMalloc(&d_c_, m*n*batch_size*sizeof(float)));
-        CHECK_ZERO(hipMemset(d_c_, 0, m*n*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMalloc(&d_a_, n*k*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMemset(d_a_, 0, n*k*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMalloc(&d_b_, k*m*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMemset(d_b_, 0, k*m*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMalloc(&d_c_, n*m*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMemset(d_c_, 0, n*m*batch_size*sizeof(float)));
 
-        CHECK_ZERO(hipMalloc(&d_ws_, result_.workspaceSize));
-        CHECK_ZERO(hipMemset(d_c_, 0, m*n*batch_size*sizeof(float)));
+        CHECK_ZERO(hipMalloc(&d_ws_, ws_size_));
         CHECK_ZERO(hipDeviceSynchronize());
     }
 
@@ -106,7 +115,7 @@ public:
                     d_c_,
                     mat_layout_c_,
                     d_c_,
-                    mat_layout_c_,
+                    mat_layout_d_,
                     &result_.algo,
                     d_ws_,
                     ws_size_,
@@ -118,6 +127,7 @@ private:
     hipblasLtMatrixLayout_t mat_layout_a_;
     hipblasLtMatrixLayout_t mat_layout_b_;
     hipblasLtMatrixLayout_t mat_layout_c_;
+    hipblasLtMatrixLayout_t mat_layout_d_;
     hipblasLtMatmulDesc_t matmul_desc_;
     hipblasLtMatmulHeuristicResult_t result_;
 
