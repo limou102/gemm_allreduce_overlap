@@ -22,6 +22,13 @@ def benchmark(
     warmup_steps=10,
     benchmark_steps=30,
 ):
+    if args.use_ccoverlap:
+        from ipc_dma.all_gather import AllGatherEngine
+        dma_engine = AllGatherEngine("test_dma_all_gather")
+        print("use cc_overlap")
+    else:
+        dma_engine = None
+
     num_comm_elements = (comm_size[0] + 3) // 4
     torch.cuda.empty_cache()
     with torch.device("cuda"):
@@ -51,7 +58,10 @@ def benchmark(
 
     def do_comm_operation():
         if args.comm_op == "all_gather":
-            dist.all_gather_into_tensor(output_tensor, comm_tensor)
+            if dma_engine:
+                dma_engine.all_gather_into_tensor(output_tensor, comm_tensor, None, "")
+            else:
+                dist.all_gather_into_tensor(output_tensor, comm_tensor)
         else:
             dist.all_reduce(comm_tensor)
 
@@ -131,6 +141,7 @@ def parse_args():
         choices = ["all_reduce", "all_gather"],
         default = "all_reduce"
     )
+    parser.add_argument("--use-ccoverlap", action="store_true", help="Enable cc_overlap using AllGatherEngine, only for --comm-op=all_gather")
 
     parser.add_argument("--num-comm-cu", type=int, default=None, help="number of CU for communication stream, default None or -1 means use all compute units")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable PyTorch profiler to generate chrome trace")

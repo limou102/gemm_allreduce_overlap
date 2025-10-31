@@ -9,7 +9,7 @@ export NCCL_SOCKET_IFNAME=lo
 gemm_shapes=(
 #"3840 3840 4352 65536000"
 #"256 3840 3840 65536000"
-"3840 3840 21760 65536000"
+"8192 8192 21760 65536000"
 #"4352 3840 3840 65536000"
 #"21760 3840 3840 65536000"
 #"2304 3840 3840 65536000"
@@ -21,7 +21,7 @@ common_command='torchrun --nproc_per_node=8 --rdzv_backend c10d --rdzv_endpoint=
 
 for shape in "${gemm_shapes[@]}"; do
     read -r m n k comm_size<<< "$shape"
-    launch_command_rccl="${common_command} benchmark_rccl_hipblaslt_cumask.py -m $m -n $n -k $k --comm-size $comm_size --comm-op all_reduce --num-comm-cu -1 2>/dev/null"
+    launch_command_rccl="${common_command} benchmark_rccl_hipblaslt_cumask.py -m $m -n $n -k $k --comm-size $comm_size --comm-op all_gather --num-comm-cu -1 -p"
     echo "launch with command : $launch_command_rccl"
     eval $launch_command_rccl
 
